@@ -6,10 +6,66 @@
   path = libosmo-abis
   url = https://github.com/osmocom/libosmo-abis.git 
 
+[submodule "libosmocore"]
+  path = libosmocore
+  url = https://github.com/osmocom/libosmocore.git 
+
+[submodule "libosmo-gprs"]
+  path = libosmo-gprs
+  url = https://github.com/osmocom/libosmo-gprs.git 
+
 [submodule "libosmo-netif"]
   path = libosmo-netif
   url = https://github.com/osmocom/libosmo-netif.git 
 
-[submodule "libosmocore"]
-  path = libosmocore
-  url = https://github.com/osmocom/libosmocore.git 
+[submodule "libosmo-sccp"]
+  path = libosmo-sccp
+  url = https://github.com/osmocom/libosmo-sccp.git 
+
+[submodule "libosmo-sigtran"]
+  path = libosmo-sigtran
+  url = https://github.com/osmocom/libosmo-sigtran.git 
+
+[submodule "libsmpp34"]
+  path = libsmpp34
+  url = https://github.com/osmocom/libsmpp34.git 
+
+[submodule "osmo-bsc"]
+  path = osmo-bsc
+  url = https://github.com/osmocom/osmo-bsc.git 
+
+[submodule "osmo-bts"]
+  path = osmo-bts
+  url = https://github.com/osmocom/osmo-bts.git 
+
+[submodule "osmo-ggsn"]
+  path = osmo-ggsn
+  url = https://github.com/osmocom/osmo-ggsn.git 
+
+[submodule "osmo-hlr"]
+  path = osmo-hlr
+  url = https://github.com/osmocom/osmo-hlr.git 
+
+[submodule "osmo-iuh"]
+  path = osmo-iuh
+  url = https://github.com/osmocom/osmo-iuh.git 
+
+[submodule "osmo-mgw"]
+  path = osmo-mgw
+  url = https://github.com/osmocom/osmo-mgw.git 
+
+[submodule "osmo-msc"]
+  path = osmo-msc
+  url = https://github.com/osmocom/osmo-msc.git 
+
+[submodule "osmo-sgsn"]
+  path = osmo-sgsn
+  url = https://github.com/osmocom/osmo-sgsn.git 
+
+[submodule "osmo-trx"]
+  path = osmo-trx
+  url = https://github.com/osmocom/osmo-trx.git 
+
+[submodule "osmocom-bb"]
+  path = osmocom-bb
+  url = https://github.com/osmocom/osmocom-bb.git 
