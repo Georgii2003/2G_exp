@@ -1,0 +1,15 @@
+[submodule "libasn1c"]
+  path = libasn1c
+  url = https://github.com/fairwaves/libasn1c.git 
+
+[submodule "libosmo-abis"]
+  path = libosmo-abis
+  url = https://github.com/osmocom/libosmo-abis.git 
+
+[submodule "libosmo-netif"]
+  path = libosmo-netif
+  url = https://github.com/osmocom/libosmo-netif.git 
+
+[submodule "libosmocore"]
+  path = libosmocore
+  url = https://github.com/osmocom/libosmocore.git 
