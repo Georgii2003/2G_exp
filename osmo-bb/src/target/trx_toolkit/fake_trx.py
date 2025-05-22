@@ -102,7 +102,11 @@ class FakeTRX(Transceiver):
 	All of them are handled by our custom CTRL command handler.
 
 	"""
-
+	# Константы для модуляции
+	DEFAULT_SPS = 4            # Samples per symbol
+	BURST_LEN = 625            # Длина burst-а для sps == 4
+	MAX_BITS = 156             # Максимальное число бит для burst-а
+	
 	NOMINAL_TX_POWER_DEFAULT = 50 # dBm
 	TX_ATT_DEFAULT = 0 # dB
 	PATH_LOSS_DEFAULT = 110 # dB
@@ -140,6 +144,12 @@ class FakeTRX(Transceiver):
 		# Path loss simulation (burst dropping)
 		self.burst_drop_amount = 0
 		self.burst_drop_period = 1
+		
+	        # Переменная для хранения сырых данных
+	        self.raw_data = None
+	        # Инициализация таблиц и фильтров для GMSK-модуляции
+	        self.rotation_tables = self.init_gmsk_rotation_tables()
+	        self.gsm_pulse = self.generate_gsm_pulse(sps=self.DEFAULT_SPS)
 
 	@property
 	def toa256(self):
@@ -178,20 +188,67 @@ class FakeTRX(Transceiver):
 		ci_max = self.ci_base + self.ci_rand_threshold
 		return random.randint(ci_min, ci_max)
 
-	# Path loss simulation: burst dropping
-	# Returns: True - drop, False - keep
-	def sim_burst_drop(self, msg):
-		# Check if dropping is required
-		if self.burst_drop_amount == 0:
+	# --- Таблицы ротаций (эмуляция работы GMSKRotation) ---
+	def init_gmsk_rotation_tables(self):
+	        # Для 4 SPS
+	        rot4 = np.exp(1j * np.arange(self.BURST_LEN) * (np.pi/8))
+	        rev_rot4 = np.exp(-1j * np.arange(self.BURST_LEN) * (np.pi/8))
+	        return {'rot4': rot4, 'rev_rot4': rev_rot4}
+	
+	# --- Генерация pulse shaping фильтров (эмуляция GSMPulse4) ---
+	def generate_gsm_pulse(self, sps=4):
+	        if sps != self.DEFAULT_SPS:
+	            raise ValueError(f"Поддерживается только sps=={self.DEFAULT_SPS}")
+	        c0 = np.array([
+	            0.0, 4.46348606e-03, 2.84385729e-02, 1.03184855e-01,
+	            2.56065552e-01, 4.76375085e-01, 7.05961177e-01, 8.71291644e-01,
+	            9.29453645e-01, 8.71291644e-01, 7.05961177e-01, 4.76375085e-01,
+	            2.56065552e-01, 1.03184855e-01, 2.84385729e-02, 4.46348606e-03
+	        ], dtype=np.float32)
+	        c1 = np.array([
+	            0.0, 8.16373112e-03, 2.84385729e-02, 5.64158904e-02,
+	            7.05463553e-02, 5.64158904e-02, 2.84385729e-02, 8.16373112e-03
+	        ], dtype=np.float32)
+	        return {'c0': c0, 'c1': c1}
+
+	# --- Реализация Laurent‑модуляции GMSK ---
+	def modulate_burst_laurent(self, bits, sps=4):
+	        if len(bits) > self.MAX_BITS:
+	            raise ValueError(f"Слишком много бит (max {self.MAX_BITS})")
+	        burst_len = self.BURST_LEN
+	        # Инициализируем C0
+	        c0_burst = -np.ones(burst_len, dtype=np.float32)
+	        main_indices = np.arange(sps, sps * (len(bits) + 1), sps)
+	        c0_burst[main_indices] = 2 * bits - 1.0  # мапинг 0-> -1, 1->+1
+	        # Применяем ротацию
+	        c0_burst_complex = c0_burst.astype(np.complex64) * self.rotation_tables['rot4']
+	        # Инициализируем C1
+	        c1_burst = np.zeros(burst_len, dtype=np.complex64)
+	        # Заполняем C1 (пример упрощен)
+	        ptr = 2 * sps
+	        if ptr < burst_len:
+	            c1_burst[ptr] = c0_burst_complex[ptr] * (1j * -1)
+	        # Пульсовое формирование
+	        c0_shaped = convolve(c0_burst_complex, self.gsm_pulse['c0'], mode='same')
+	        c1_shaped = convolve(c1_burst, self.gsm_pulse['c1'], mode='same')
+	        # Итоговый сигнал
+	        modulated_signal = c0_shaped + c1_shaped
+	        return modulated_signal
+		
+		# Path loss simulation: burst dropping
+		# Returns: True - drop, False - keep
+		def sim_burst_drop(self, msg):
+			# Check if dropping is required
+			if self.burst_drop_amount == 0:
+				return False
+	
+			if msg.fn % self.burst_drop_period == 0:
+				log.info("(%s) Simulation: dropping burst (fn=%u %% %u == 0)"
+					% (self, msg.fn, self.burst_drop_period))
+				self.burst_drop_amount -= 1
+				return True
+	
 			return False
-
-		if msg.fn % self.burst_drop_period == 0:
-			log.info("(%s) Simulation: dropping burst (fn=%u %% %u == 0)"
-				% (self, msg.fn, self.burst_drop_period))
-			self.burst_drop_amount -= 1
-			return True
-
-		return False
 
 	def _handle_data_msg_v1(self, src_msg, msg):
 		# C/I (Carrier-to-Interference ratio)
@@ -237,6 +294,24 @@ class FakeTRX(Transceiver):
 			self.data_if.send_msg(msg)
 			return
 
+		 # === Сохранение сырых данных ===
+		  self.raw_data = src_msg.burst  # Копирование данных
+		  bit_array = list(map(int, src_msg.burst))
+		  np_bit_array = np.asarray(bit_array, dtype=np.float32)
+		  print(f"[RAW] Burst data: {bit_array}")
+		  modulated_signal = mod.modulate_burst_laurent(np_bit_array)
+		  channel_signal = mod.channel()
+		  demodulated_bits = mod.demodulate()
+		  
+		  time.sleep(100)
+		  # === Сохранение сырых данных в файл ===
+		  # self.save_raw_data_to_file(self.raw_data)  # Сохранение в файл
+		
+		  # === Вывод сырых данных ===
+		  print(f"[RAW] Burst data: {src_msg.burst} (length: {len(src_msg.burst)})")
+		  # =========================
+  
+		
 		# Complete message header
 		msg.toa256 = self.toa256
 
