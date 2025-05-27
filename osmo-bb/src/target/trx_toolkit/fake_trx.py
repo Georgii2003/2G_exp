@@ -28,6 +28,9 @@ import select
 import sys
 import re
 import os
+import numpy as np
+from scipy.signal import lfilter
+import time
 
 from app_common import ApplicationBase
 from burst_fwd import BurstForwarder
@@ -37,6 +40,75 @@ from clck_gen import CLCKGen
 from trx_list import TRXList
 from fake_pm import FakePM
 from gsm_shared import *
+
+from dataclasses import dataclass
+
+@dataclass
+class Ray:
+    PropagationDistance: float  # расстояние в метрах
+
+def gaussian_filter(bt, sps, ntaps=4):
+    n = ntaps * sps
+    t = np.linspace(-ntaps/2, ntaps/2, n)
+    alpha = np.sqrt(np.log(2)) / (2 * np.pi * bt)
+    h = np.exp(-0.5 * (t / alpha)**2)
+    h /= np.sum(h)
+    return h
+
+def gmsk_modulate(bits, sps=4, bt=0.3):
+    nrz = 2 * np.array(bits, dtype=np.float32) - 1.0
+    up = np.zeros(len(nrz) * sps)
+    up[::sps] = nrz
+    h = gaussian_filter(bt, sps, ntaps=4)
+    filtered = lfilter(h, 1.0, up)
+    phase = np.cumsum(filtered) * (np.pi/2) / sps
+    signal = np.exp(1j * phase)
+    return signal
+
+def gmsk_demodulate(signal, sps=4, offset=2, num_bits=None):
+    phase = np.unwrap(np.angle(signal))
+    diff = np.diff(phase)
+    if num_bits is None:
+        num_bits = (len(diff) - offset) // sps
+    indices = offset + np.arange(num_bits) * sps
+    samples = diff[indices]
+    bits = (samples > 0).astype(int)
+    return bits, samples
+
+def multipath(msg_complex, frequency, rays):
+		rays_quantity = len(rays)
+		CH_bandwidth = 10e6  # 10 МГц
+		duration_sample = 1 / CH_bandwidth
+		speed_light = 3e8
+
+		ray_distances = np.array([ray.PropagationDistance / 1000 for ray in rays])  # в км
+
+		idx_min = np.argmin(ray_distances)
+		ray_distances = np.concatenate(([ray_distances[idx_min]], np.delete(ray_distances, idx_min)))
+		rays_sorted = [rays[idx_min]] + [rays[i] for i in range(len(rays)) if i != idx_min]
+		
+		delays = np.zeros(rays_quantity, dtype=int)
+		for i in range(rays_quantity):
+			delays[i] = int(round((ray_distances[i] - ray_distances[0]) * 1000 / (speed_light * duration_sample)))
+		max_delay = delays.max()
+		data_with_delays = np.zeros((rays_quantity, len(msg_complex) + max_delay), dtype=complex)
+		for i in range(rays_quantity):
+			if delays[i] == 0:
+				data_with_delays[i, :len(msg_complex)] = msg_complex
+			else:
+				data_with_delays[i, delays[i]:delays[i]+len(msg_complex)] = msg_complex
+		return data_with_delays, ray_distances, rays_quantity
+
+def cost_hata(data_with_delays, tx_height, rx_height, ray_distances, frequency, rays_quantity):
+		data_PL = np.zeros_like(data_with_delays, dtype=complex)
+		for i in range(rays_quantity):
+			a_height_rx = (1.1 * np.log10(frequency/1e6) - 0.7) * rx_height - (1.56 * np.log10(frequency/1e6) - 0.8)
+			PL = 46.3 + 33.9 * np.log10(frequency/1e6) - 13.82 * np.log10(tx_height) - a_height_rx + \
+				(44.9 - 6.55 * np.log10(tx_height)) * np.log10(ray_distances[i])
+			attenuation = 10 ** (-PL / 10)
+			data_PL[i, :] = data_with_delays[i, :] * attenuation
+		return data_PL
+
 
 class FakeTRX(Transceiver):
 	""" Fake transceiver with RF path (burst loss, RSSI, TA, ToA) simulation.
@@ -102,7 +174,7 @@ class FakeTRX(Transceiver):
 	All of them are handled by our custom CTRL command handler.
 
 	"""
-
+	
 	NOMINAL_TX_POWER_DEFAULT = 50 # dBm
 	TX_ATT_DEFAULT = 0 # dB
 	PATH_LOSS_DEFAULT = 110 # dB
@@ -116,30 +188,27 @@ class FakeTRX(Transceiver):
 	CI_NOISE_DEFAULT = -30
 
 	def __init__(self, *trx_args, **trx_kwargs):
-		Transceiver.__init__(self, *trx_args, **trx_kwargs)
+			Transceiver.__init__(self, *trx_args, **trx_kwargs)
+			# fake RSSI is disabled by default
+			self.fake_rssi_enabled = False
+			self.rf_muted = False
+			# Actual ToA, RSSI, C/I, TA values
+			self.tx_power_base = self.NOMINAL_TX_POWER_DEFAULT
+			self.tx_att_base = self.TX_ATT_DEFAULT
+			self.toa256_base = self.TOA256_BASE_DEFAULT
+			self.rssi_base = self.NOMINAL_TX_POWER_DEFAULT - self.TX_ATT_DEFAULT - self.PATH_LOSS_DEFAULT
+			self.ci_base = self.CI_BASE_DEFAULT
+			self.ta = 0
+			# ToA, RSSI, C/I randomization thresholds
+			self.toa256_rand_threshold = 0
+			self.rssi_rand_threshold = 0
+			self.ci_rand_threshold = 0
+			# Path loss simulation (burst dropping)
+			self.burst_drop_amount = 0
+			self.burst_drop_period = 1
 
-		# fake RSSI is disabled by default, only enabled through TRXC FAKE_RSSI.
-		# When disabled, RSSI is calculated based on Tx power and Rx path loss
-		self.fake_rssi_enabled = False
-
-		self.rf_muted = False
-
-		# Actual ToA, RSSI, C/I, TA values
-		self.tx_power_base = self.NOMINAL_TX_POWER_DEFAULT
-		self.tx_att_base = self.TX_ATT_DEFAULT
-		self.toa256_base = self.TOA256_BASE_DEFAULT
-		self.rssi_base = self.NOMINAL_TX_POWER_DEFAULT - self.TX_ATT_DEFAULT - self.PATH_LOSS_DEFAULT
-		self.ci_base = self.CI_BASE_DEFAULT
-		self.ta = 0
-
-		# ToA, RSSI, C/I randomization thresholds
-		self.toa256_rand_threshold = 0
-		self.rssi_rand_threshold = 0
-		self.ci_rand_threshold = 0
-
-		# Path loss simulation (burst dropping)
-		self.burst_drop_amount = 0
-		self.burst_drop_period = 1
+			# Переменная для хранения сырых данных
+			self.raw_data = None
 
 	@property
 	def toa256(self):
@@ -178,8 +247,6 @@ class FakeTRX(Transceiver):
 		ci_max = self.ci_base + self.ci_rand_threshold
 		return random.randint(ci_min, ci_max)
 
-	# Path loss simulation: burst dropping
-	# Returns: True - drop, False - keep
 	def sim_burst_drop(self, msg):
 		# Check if dropping is required
 		if self.burst_drop_amount == 0:
@@ -187,10 +254,9 @@ class FakeTRX(Transceiver):
 
 		if msg.fn % self.burst_drop_period == 0:
 			log.info("(%s) Simulation: dropping burst (fn=%u %% %u == 0)"
-				% (self, msg.fn, self.burst_drop_period))
+					% (self, msg.fn, self.burst_drop_period))
 			self.burst_drop_amount -= 1
 			return True
-
 		return False
 
 	def _handle_data_msg_v1(self, src_msg, msg):
@@ -206,7 +272,7 @@ class FakeTRX(Transceiver):
 			ss = TrainingSeqGMSK.pick(src_msg.burst)
 			msg.tsc = ss.tsc if ss is not None else 0
 			msg.tsc_set = ss.tsc_set if ss is not None else 0
-		else: # TODO: other modulation types (at least 8-PSK)
+		else:  # TODO: other modulation types (at least 8-PSK)
 			msg.tsc_set = 0
 			msg.tsc = 0
 
@@ -217,16 +283,16 @@ class FakeTRX(Transceiver):
 		if self.rf_muted:
 			msg.nope_ind = True
 		elif not msg.nope_ind:
-			# Path loss simulation
+    	# Path loss simulation
 			msg.nope_ind = self.sim_burst_drop(msg)
 		if msg.nope_ind:
-			# Before TRXDv1, we simply drop the message
+		# Before TRXDv1, we simply drop the message
 			if msg.ver < 0x01:
 				del msg
 				return
 
-			# Since TRXDv1, we should send a NOPE.ind
-			del msg.burst # burst bits are omited
+		# Since TRXDv1, we should send a NOPE.ind
+			del msg.burst  # burst bits are omited
 			msg.burst = None
 
 			# TODO: shoud we make these values configurable?
@@ -237,24 +303,61 @@ class FakeTRX(Transceiver):
 			self.data_if.send_msg(msg)
 			return
 
+		# === Сохранение сырых данных ===
+		self.raw_data = src_msg.burst  # Копирование данных
+		# --- Получаем исходные биты ---
+		bit_array = list(map(int, src_msg.burst))  # 148 бит для normal burst
+		print(f"[RAW] Burst data: {bit_array}")
+		# --- GMSK модуляция ---
+		modulated_signal = gmsk_modulate(bit_array, sps=4, bt=0.3)
+
+
+		# === Вывод сырых данных ===
+		print(f"[RAW] Burst data: {src_msg.burst} (length: {len(src_msg.burst)})")
+		# =========================
+
+		# === МНОГОЛУЧЕВОСТЬ И ЗАТУХАНИЕ КАНАЛА  ===
+		# channel_signal = mod.channel() - длина, высота, паслосы, многолучёвость costhata
+        # Пример параметров лучей, частоты и антенн:
+		rays = [
+            Ray(PropagationDistance=1000.0),   # 1000 м
+            Ray(PropagationDistance=1200.0),   # 1200 м
+            Ray(PropagationDistance=1500.0)    # 1500 м
+        ]
+		frequency = 900e6  # 900 МГц, для GSM
+		tx_height = 30.0   # высота антенны передатчика, м
+		rx_height = 1.5    # высота антенны приемника, м
+
+        # 1. Эффект многолучёвости
+		data_with_delays, ray_distances, rays_quantity = multipath(modulated_signal, frequency, rays)
+
+        # 2. Эффект затухания Cost Hata
+		data_with_pathloss = cost_hata(data_with_delays, tx_height, rx_height, ray_distances, frequency, rays_quantity)
+
+        # 3. Итоговый принимаемый сигнал выглядит как сумма по лучам
+		received_signal = np.sum(data_with_pathloss, axis=0)[:625]
+		# demodulated_bits = mod.demodulate()
+		# bits, softbits = demodulate_burst_laurent(received_signal, sps=4)
+		# print("[DEMOD] bits:", bits)
+		# print("[DEMOD] softbits:", softbits[:10])
+		# --- GMSK демодуляция ---
+		# offset=2 для sps=4 и стандартного фильтра
+		demod_bits, soft = gmsk_demodulate(received_signal, sps=4, offset=2, num_bits=148)
+		print("[DEMOD] bits:", demod_bits)
+		time.sleep(100)
+
 		# Complete message header
 		msg.toa256 = self.toa256
 
 		# Apply RSSI based on transmitter:
 		if not self.fake_rssi_enabled:
 			msg.rssi = src_trx.tx_power - src_msg.pwr - self.PATH_LOSS_DEFAULT
-		else: # Apply fake RSSI
+		else:  # Apply fake RSSI
 			msg.rssi = self.rssi
 
 		# Version specific fields
 		if msg.ver >= 0x01:
 			self._handle_data_msg_v1(src_msg, msg)
-########################################################################
-## место вставки вывода бёрста
-########################################################################
-	    	#burst_copy = np.copy(msg.burst)
-    		#log.debug("RX_DATA_IND: Original burst (first 16 samples): %s", msg.burst)
-			log.debug("RX_DATA_IND: Original burst (first 16 samples):")
 
 		# Apply optional Timing Advance
 		if src_trx.ta != 0:
@@ -346,7 +449,7 @@ class FakeTRX(Transceiver):
 			num = int(request[1])
 			if num < 0:
 				log.error("(%s) FAKE_DROP amount shall not "
-					"be negative" % self)
+						"be negative" % self)
 				return -1
 
 			self.burst_drop_amount = num
@@ -363,14 +466,14 @@ class FakeTRX(Transceiver):
 			num = int(request[1])
 			if num < 0:
 				log.error("(%s) FAKE_DROP amount shall not "
-					"be negative" % self)
+						"be negative" % self)
 				return -1
 
 			# Parse / validate period
 			period = int(request[2])
 			if period <= 0:
 				log.error("(%s) FAKE_DROP period shall "
-					"be greater than zero" % self)
+						"be greater than zero" % self)
 				return -1
 
 			self.burst_drop_amount = num
@@ -384,7 +487,7 @@ class FakeTRX(Transceiver):
 
 			self.ctrl_if.rsp_delay_ms = int(request[1])
 			log.info("(%s) Artificial TRXC delay set to %d",
-				 self, self.ctrl_if.rsp_delay_ms)
+					self, self.ctrl_if.rsp_delay_ms)
 
 		# Unhandled command
 		return None
