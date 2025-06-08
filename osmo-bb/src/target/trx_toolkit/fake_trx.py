@@ -45,69 +45,94 @@ from dataclasses import dataclass
 
 @dataclass
 class Ray:
-    PropagationDistance: float  # расстояние в метрах
+    PropagationDistance: float  # в метрах
+    RelativePower: float = 1.0  # можно задавать, если надо
 
 def gaussian_filter(bt, sps, ntaps=4):
     n = ntaps * sps
-    t = np.linspace(-ntaps/2, ntaps/2, n)
+    t = np.linspace(-ntaps/2, ntaps/2, n, endpoint=False)
     alpha = np.sqrt(np.log(2)) / (2 * np.pi * bt)
     h = np.exp(-0.5 * (t / alpha)**2)
     h /= np.sum(h)
     return h
 
-def gmsk_modulate(bits, sps=4, bt=0.3):
+# def gmsk_modulate(bits, sps=4, bt=0.3):
+#     nrz = 2 * np.array(bits, dtype=np.float32) - 1.0
+#     up = np.zeros(len(nrz) * sps)
+#     up[::sps] = nrz
+#     # h = gaussian_filter(bt, sps, ntaps=4)
+#     # filtered = lfilter(h, 1.0, up)
+#     # phase = np.cumsum(filtered) * (np.pi/2) / sps
+#     phase = np.cumsum(up) * (np.pi/2) / sps   # <-- чистая интеграция NRZ!
+#     signal = np.exp(1j * phase)
+#     return signal
+
+def gmsk_modulate(bits, sps=1, bt=0.3):
     nrz = 2 * np.array(bits, dtype=np.float32) - 1.0
-    up = np.zeros(len(nrz) * sps)
-    up[::sps] = nrz
-    h = gaussian_filter(bt, sps, ntaps=4)
-    filtered = lfilter(h, 1.0, up)
-    phase = np.cumsum(filtered) * (np.pi/2) / sps
+    up = nrz  # нет апсемплинга!
+    # phase = np.cumsum(up) * (np.pi/2) / sps  # sps=1 -> просто np.cumsum(up)*(pi/2)
+    phase = np.cumsum(up) * (np.pi/2)
     signal = np.exp(1j * phase)
     return signal
 
-def gmsk_demodulate(signal, sps=4, offset=2, num_bits=None):
-    phase = np.unwrap(np.angle(signal))
-    diff = np.diff(phase)
-    if num_bits is None:
-        num_bits = (len(diff) - offset) // sps
-    indices = offset + np.arange(num_bits) * sps
-    samples = diff[indices]
-    bits = (samples > 0).astype(int)
-    return bits, samples
-
 def multipath(msg_complex, frequency, rays):
-		rays_quantity = len(rays)
-		CH_bandwidth = 10e6  # 10 МГц
-		duration_sample = 1 / CH_bandwidth
-		speed_light = 3e8
-
-		ray_distances = np.array([ray.PropagationDistance / 1000 for ray in rays])  # в км
-
-		idx_min = np.argmin(ray_distances)
-		ray_distances = np.concatenate(([ray_distances[idx_min]], np.delete(ray_distances, idx_min)))
-		rays_sorted = [rays[idx_min]] + [rays[i] for i in range(len(rays)) if i != idx_min]
-		
-		delays = np.zeros(rays_quantity, dtype=int)
-		for i in range(rays_quantity):
-			delays[i] = int(round((ray_distances[i] - ray_distances[0]) * 1000 / (speed_light * duration_sample)))
-		max_delay = delays.max()
-		data_with_delays = np.zeros((rays_quantity, len(msg_complex) + max_delay), dtype=complex)
-		for i in range(rays_quantity):
-			if delays[i] == 0:
-				data_with_delays[i, :len(msg_complex)] = msg_complex
-			else:
-				data_with_delays[i, delays[i]:delays[i]+len(msg_complex)] = msg_complex
-		return data_with_delays, ray_distances, rays_quantity
+    rays_quantity = len(rays)
+    CH_bandwidth = 200e3  # GSM канал 200 кГц!
+    duration_sample = 1 / CH_bandwidth
+    speed_light = 3e8
+    ray_distances = np.array([ray.PropagationDistance for ray in rays])
+    idx_min = np.argmin(ray_distances)
+    ray_distances = np.concatenate(([ray_distances[idx_min]], np.delete(ray_distances, idx_min)))
+    rays_sorted = [rays[idx_min]] + [rays[i] for i in range(len(rays)) if i != idx_min]
+    delays = np.zeros(rays_quantity, dtype=int)
+    for i in range(rays_quantity):
+        delay_seconds = (ray_distances[i] - ray_distances[0]) / speed_light
+        delays[i] = int(round(delay_seconds / duration_sample))
+    max_delay = delays.max()
+    data_with_delays = np.zeros((rays_quantity, len(msg_complex) + max_delay), dtype=complex)
+    for i in range(rays_quantity):
+        start_idx = delays[i]
+        end_idx = start_idx + len(msg_complex)
+        data_with_delays[i, start_idx:end_idx] = msg_complex * rays_sorted[i].RelativePower
+    return data_with_delays, ray_distances, rays_quantity
 
 def cost_hata(data_with_delays, tx_height, rx_height, ray_distances, frequency, rays_quantity):
-		data_PL = np.zeros_like(data_with_delays, dtype=complex)
-		for i in range(rays_quantity):
-			a_height_rx = (1.1 * np.log10(frequency/1e6) - 0.7) * rx_height - (1.56 * np.log10(frequency/1e6) - 0.8)
-			PL = 46.3 + 33.9 * np.log10(frequency/1e6) - 13.82 * np.log10(tx_height) - a_height_rx + \
-				(44.9 - 6.55 * np.log10(tx_height)) * np.log10(ray_distances[i])
-			attenuation = 10 ** (-PL / 10)
-			data_PL[i, :] = data_with_delays[i, :] * attenuation
-		return data_PL
+    data_PL = np.zeros_like(data_with_delays, dtype=complex)
+    for i in range(rays_quantity):
+        distance_km = max(ray_distances[i]/1000, 0.001)
+        a_height_rx = (1.1 * np.log10(frequency/1e6) - 0.7) * rx_height - (1.56 * np.log10(frequency/1e6) - 0.8)
+        PL = 46.3 + 33.9 * np.log10(frequency/1e6) - 13.82 * np.log10(tx_height) - a_height_rx + \
+             (44.9 - 6.55 * np.log10(tx_height)) * np.log10(distance_km)
+        attenuation = 10 ** (-PL / 20)
+        data_PL[i, :] = data_with_delays[i, :] * attenuation
+    return data_PL
+
+def add_awgn(signal, snr_db):
+    signal_power = np.mean(np.abs(signal)**2)
+    snr_linear = 10**(snr_db / 10)
+    noise_power = signal_power / snr_linear
+    noise = np.sqrt(noise_power / 2) * (np.random.randn(len(signal)) + 1j*np.random.randn(len(signal)))
+    return signal + noise
+
+# def gardner_ted(samples, sps, mu=0.0, num_symbols=148, gain=0.01):
+#     out = []
+#     for _ in range(num_symbols):
+#         idx = int(mu)
+#         if idx + sps >= len(samples):
+#             break
+#         s0 = samples[idx]
+#         s05 = samples[idx + sps//2]
+#         s1 = samples[idx + sps]
+#         error = np.real(s05) * (np.real(s1) - np.real(s0)) + np.imag(s05) * (np.imag(s1) - np.imag(s0))
+#         mu += sps + gain * error
+#         out.append(s05)
+#     return np.array(out)
+
+def gmsk_differential_demod(samples, sps):
+    resampled = samples[sps//2::sps]
+    phase_diff = np.angle(resampled[1:] * np.conj(resampled[:-1]))
+    bits = (phase_diff > 0).astype(int)
+    return bits
 
 
 class FakeTRX(Transceiver):
@@ -283,87 +308,97 @@ class FakeTRX(Transceiver):
 		if self.rf_muted:
 			msg.nope_ind = True
 		elif not msg.nope_ind:
-    	# Path loss simulation
 			msg.nope_ind = self.sim_burst_drop(msg)
 		if msg.nope_ind:
-		# Before TRXDv1, we simply drop the message
 			if msg.ver < 0x01:
 				del msg
 				return
-
-		# Since TRXDv1, we should send a NOPE.ind
-			del msg.burst  # burst bits are omited
+			del msg.burst
 			msg.burst = None
-
-			# TODO: shoud we make these values configurable?
 			msg.toa256 = self.TOA256_NOISE_DEFAULT
 			msg.rssi = self.RSSI_NOISE_DEFAULT
 			msg.ci = self.CI_NOISE_DEFAULT
-
 			self.data_if.send_msg(msg)
 			return
 
-		# === Сохранение сырых данных ===
-		self.raw_data = src_msg.burst  # Копирование данных
 		# --- Получаем исходные биты ---
-		bit_array = list(map(int, src_msg.burst))  # 148 бит для normal burst
-		print(f"[RAW] Burst data: {bit_array}")
+		bit_array = np.array(list(map(int, src_msg.burst)), dtype=np.uint8)
+		print(f"[RAW] Burst bits: {bit_array.tolist()}")
+
+		# --- Дифференциальное кодирование для GMSK ---
+		diff = np.zeros_like(bit_array)
+		diff[0] = bit_array[0]
+		for i in range(1, len(bit_array)):
+			diff[i] = diff[i-1] ^ bit_array[i]
+		print(f"[DIFF] Diff-encoded bits: {diff.tolist()}")
+
 		# --- GMSK модуляция ---
-		modulated_signal = gmsk_modulate(bit_array, sps=4, bt=0.3)
+		modulated_signal = gmsk_modulate(diff, sps=1, bt=0.3)
 
-
-		# === Вывод сырых данных ===
-		print(f"[RAW] Burst data: {src_msg.burst} (length: {len(src_msg.burst)})")
-		# =========================
-
-		# === МНОГОЛУЧЕВОСТЬ И ЗАТУХАНИЕ КАНАЛА  ===
-		# channel_signal = mod.channel() - длина, высота, паслосы, многолучёвость costhata
-        # Пример параметров лучей, частоты и антенн:
+		# --- Многолучёвость и затухание ---
 		rays = [
-            Ray(PropagationDistance=1000.0),   # 1000 м
-            Ray(PropagationDistance=1200.0),   # 1200 м
-            Ray(PropagationDistance=1500.0)    # 1500 м
-        ]
-		frequency = 900e6  # 900 МГц, для GSM
-		tx_height = 30.0   # высота антенны передатчика, м
-		rx_height = 1.5    # высота антенны приемника, м
+			Ray(PropagationDistance=1000.0),
+			Ray(PropagationDistance=1200.0),
+			Ray(PropagationDistance=1500.0)
+		]
+		frequency = 900e6
+		tx_height = 30.0
+		rx_height = 1.5
 
-        # 1. Эффект многолучёвости
 		data_with_delays, ray_distances, rays_quantity = multipath(modulated_signal, frequency, rays)
-
-        # 2. Эффект затухания Cost Hata
 		data_with_pathloss = cost_hata(data_with_delays, tx_height, rx_height, ray_distances, frequency, rays_quantity)
+		received_signal = np.sum(data_with_pathloss, axis=0)[:len(modulated_signal)]
+		SNR_DB = 10
+		# noisy_signal = add_awgn(received_signal, snr_db=SNR_DB)
+		noisy_signal = add_awgn(modulated_signal, snr_db=SNR_DB)
 
-        # 3. Итоговый принимаемый сигнал выглядит как сумма по лучам
-		received_signal = np.sum(data_with_pathloss, axis=0)[:625]
-		# demodulated_bits = mod.demodulate()
-		# bits, softbits = demodulate_burst_laurent(received_signal, sps=4)
-		# print("[DEMOD] bits:", bits)
-		# print("[DEMOD] softbits:", softbits[:10])
-		# --- GMSK демодуляция ---
-		# offset=2 для sps=4 и стандартного фильтра
-		demod_bits, soft = gmsk_demodulate(received_signal, sps=4, offset=2, num_bits=148)
-		print("[DEMOD] bits:", demod_bits)
+		# --- Демодуляция: ресемплируем по центру каждого символа ---
+		N = len(bit_array)
+		resampled = noisy_signal  # теперь длина N
+		phase_diff = np.angle(resampled[1:] * np.conj(resampled[:-1]))
+		demod = (phase_diff > 0).astype(np.uint8)
+		demod_dec = np.zeros_like(demod)
+		demod_dec[0] = demod[0]
+		for i in range(1, len(demod)):
+			demod_dec[i] = demod_dec[i-1] ^ demod[i]
+		ber = np.sum(diff[1:] != demod_dec) / (N-1)
+		print(f"BER: {ber:.4f}")
+		print("phase_diff[:10]:", phase_diff[:10])
+
+		# --- Дифференциальная декодировка ---
+		# demod_dec = np.zeros_like(demod)
+		# demod_dec[0] = demod[0]
+		# for i in range(1, len(demod)):
+		# 	demod_dec[i] = demod_dec[i-1] ^ demod[i]
+
+		# # --- Анализ BER (сравниваем только diff[1:] и demod_dec) ---
+		# ber = np.sum(diff[1:] != demod_dec) / (N-1)
+		# print(f"[BER] Bit Error Rate (DIFF-chain, SNR={SNR_DB} dB): {ber:.4f} (по {N-1} битам)")
+		print("diff[1:10]:", diff[1:10])
+		print("demod_dec[0:9]:", demod_dec[:9])
+
+		print("resampled[:5]:", resampled[:5])
+		print("phase_diff[:10]:", phase_diff[:10])
+		print("demod[:10]:", demod[:10])
+		print("diff[1:11]:", diff[1:11])
+		print("demod_dec[:10]:", demod_dec[:10])
+		print("diff==demod_dec:", diff[1:11]==demod_dec[:10])
+
 		time.sleep(100)
 
-		# Complete message header
+		# --- Остальной код по формированию msg ---
 		msg.toa256 = self.toa256
-
-		# Apply RSSI based on transmitter:
 		if not self.fake_rssi_enabled:
 			msg.rssi = src_trx.tx_power - src_msg.pwr - self.PATH_LOSS_DEFAULT
-		else:  # Apply fake RSSI
+		else:
 			msg.rssi = self.rssi
-
-		# Version specific fields
 		if msg.ver >= 0x01:
 			self._handle_data_msg_v1(src_msg, msg)
-
-		# Apply optional Timing Advance
 		if src_trx.ta != 0:
 			msg.toa256 -= src_trx.ta * 256
 
 		Transceiver.handle_data_msg(self, msg)
+
 
 	# Simulation specific CTRL command handler
 	def ctrl_cmd_handler(self, request):
