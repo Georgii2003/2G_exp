@@ -56,24 +56,18 @@ def gaussian_filter(bt, sps, ntaps=4):
     h /= np.sum(h)
     return h
 
-# def gmsk_modulate(bits, sps=4, bt=0.3):
-#     nrz = 2 * np.array(bits, dtype=np.float32) - 1.0
-#     up = np.zeros(len(nrz) * sps)
-#     up[::sps] = nrz
-#     # h = gaussian_filter(bt, sps, ntaps=4)
-#     # filtered = lfilter(h, 1.0, up)
-#     # phase = np.cumsum(filtered) * (np.pi/2) / sps
-#     phase = np.cumsum(up) * (np.pi/2) / sps   # <-- чистая интеграция NRZ!
-#     signal = np.exp(1j * phase)
-#     return signal
-
-def gmsk_modulate(bits, sps=1, bt=0.3):
+def gmsk_modulate(bits):
     nrz = 2 * np.array(bits, dtype=np.float32) - 1.0
-    up = nrz  # нет апсемплинга!
-    # phase = np.cumsum(up) * (np.pi/2) / sps  # sps=1 -> просто np.cumsum(up)*(pi/2)
-    phase = np.cumsum(up) * (np.pi/2)
+    phase = np.cumsum(nrz) * (np.pi/2)
     signal = np.exp(1j * phase)
     return signal
+
+def add_awgn(signal, snr_db):
+    signal_power = np.mean(np.abs(signal)**2)
+    snr_linear = 10**(snr_db / 10)
+    noise_power = signal_power / snr_linear
+    noise = np.sqrt(noise_power / 2) * (np.random.randn(len(signal)) + 1j*np.random.randn(len(signal)))
+    return signal + noise
 
 def multipath(msg_complex, frequency, rays):
     rays_quantity = len(rays)
@@ -106,27 +100,6 @@ def cost_hata(data_with_delays, tx_height, rx_height, ray_distances, frequency, 
         attenuation = 10 ** (-PL / 20)
         data_PL[i, :] = data_with_delays[i, :] * attenuation
     return data_PL
-
-def add_awgn(signal, snr_db):
-    signal_power = np.mean(np.abs(signal)**2)
-    snr_linear = 10**(snr_db / 10)
-    noise_power = signal_power / snr_linear
-    noise = np.sqrt(noise_power / 2) * (np.random.randn(len(signal)) + 1j*np.random.randn(len(signal)))
-    return signal + noise
-
-# def gardner_ted(samples, sps, mu=0.0, num_symbols=148, gain=0.01):
-#     out = []
-#     for _ in range(num_symbols):
-#         idx = int(mu)
-#         if idx + sps >= len(samples):
-#             break
-#         s0 = samples[idx]
-#         s05 = samples[idx + sps//2]
-#         s1 = samples[idx + sps]
-#         error = np.real(s05) * (np.real(s1) - np.real(s0)) + np.imag(s05) * (np.imag(s1) - np.imag(s0))
-#         mu += sps + gain * error
-#         out.append(s05)
-#     return np.array(out)
 
 def gmsk_differential_demod(samples, sps):
     resampled = samples[sps//2::sps]
@@ -321,21 +294,15 @@ class FakeTRX(Transceiver):
 			self.data_if.send_msg(msg)
 			return
 
-		# --- Получаем исходные биты ---
 		bit_array = np.array(list(map(int, src_msg.burst)), dtype=np.uint8)
+		N = len(bit_array)
 		print(f"[RAW] Burst bits: {bit_array.tolist()}")
 
-		# --- Дифференциальное кодирование для GMSK ---
-		diff = np.zeros_like(bit_array)
-		diff[0] = bit_array[0]
-		for i in range(1, len(bit_array)):
-			diff[i] = diff[i-1] ^ bit_array[i]
-		print(f"[DIFF] Diff-encoded bits: {diff.tolist()}")
+		# GMSK модуляция (sps=1)
+		modulated_signal = gmsk_modulate(bit_array)
+		print(f"[MOD] Burst bits: {modulated_signal.tolist()}")
 
-		# --- GMSK модуляция ---
-		modulated_signal = gmsk_modulate(diff, sps=1, bt=0.3)
-
-		# --- Многолучёвость и затухание ---
+		# Многолучёвый канал + Path Loss
 		rays = [
 			Ray(PropagationDistance=1000.0),
 			Ray(PropagationDistance=1200.0),
@@ -344,49 +311,24 @@ class FakeTRX(Transceiver):
 		frequency = 900e6
 		tx_height = 30.0
 		rx_height = 1.5
-
 		data_with_delays, ray_distances, rays_quantity = multipath(modulated_signal, frequency, rays)
 		data_with_pathloss = cost_hata(data_with_delays, tx_height, rx_height, ray_distances, frequency, rays_quantity)
 		received_signal = np.sum(data_with_pathloss, axis=0)[:len(modulated_signal)]
+
 		SNR_DB = 10
-		# noisy_signal = add_awgn(received_signal, snr_db=SNR_DB)
-		noisy_signal = add_awgn(modulated_signal, snr_db=SNR_DB)
+		noisy_signal = add_awgn(received_signal, snr_db=SNR_DB)
 
-		# --- Демодуляция: ресемплируем по центру каждого символа ---
-		N = len(bit_array)
-		resampled = noisy_signal  # теперь длина N
-		phase_diff = np.angle(resampled[1:] * np.conj(resampled[:-1]))
+		# Демодуляция
+		phase_diff = np.angle(noisy_signal[1:] * np.conj(noisy_signal[:-1]))
 		demod = (phase_diff > 0).astype(np.uint8)
-		demod_dec = np.zeros_like(demod)
-		demod_dec[0] = demod[0]
-		for i in range(1, len(demod)):
-			demod_dec[i] = demod_dec[i-1] ^ demod[i]
-		ber = np.sum(diff[1:] != demod_dec) / (N-1)
-		print(f"BER: {ber:.4f}")
-		print("phase_diff[:10]:", phase_diff[:10])
-
-		# --- Дифференциальная декодировка ---
-		# demod_dec = np.zeros_like(demod)
-		# demod_dec[0] = demod[0]
-		# for i in range(1, len(demod)):
-		# 	demod_dec[i] = demod_dec[i-1] ^ demod[i]
-
-		# # --- Анализ BER (сравниваем только diff[1:] и demod_dec) ---
-		# ber = np.sum(diff[1:] != demod_dec) / (N-1)
-		# print(f"[BER] Bit Error Rate (DIFF-chain, SNR={SNR_DB} dB): {ber:.4f} (по {N-1} битам)")
-		print("diff[1:10]:", diff[1:10])
-		print("demod_dec[0:9]:", demod_dec[:9])
-
-		print("resampled[:5]:", resampled[:5])
-		print("phase_diff[:10]:", phase_diff[:10])
-		print("demod[:10]:", demod[:10])
-		print("diff[1:11]:", diff[1:11])
-		print("demod_dec[:10]:", demod_dec[:10])
-		print("diff==demod_dec:", diff[1:11]==demod_dec[:10])
+		print(f"[DEMOD] Burst bits: {demod.tolist()}")
+		clen = min(N-1, len(demod))
+		ber = np.sum(bit_array[1:1+clen] != demod[:clen]) / clen
+		ber_inv = np.sum(1-bit_array[1:1+clen] != demod[:clen]) / clen
+		print("[BER]:", ber, "inv:", ber_inv)
 
 		time.sleep(100)
 
-		# --- Остальной код по формированию msg ---
 		msg.toa256 = self.toa256
 		if not self.fake_rssi_enabled:
 			msg.rssi = src_trx.tx_power - src_msg.pwr - self.PATH_LOSS_DEFAULT
@@ -398,6 +340,7 @@ class FakeTRX(Transceiver):
 			msg.toa256 -= src_trx.ta * 256
 
 		Transceiver.handle_data_msg(self, msg)
+
 
 
 	# Simulation specific CTRL command handler
