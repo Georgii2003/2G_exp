@@ -29,7 +29,10 @@ import sys
 import re
 import os
 import numpy as np
-from scipy.signal import lfilter
+from dataclasses import dataclass
+import matplotlib.pyplot as plt
+from scipy.signal import lfilter, correlate
+from scipy.interpolate import CubicSpline
 import time
 
 from app_common import ApplicationBase
@@ -43,11 +46,13 @@ from gsm_shared import *
 
 from dataclasses import dataclass
 
+# ===== Конфигурация канала =====
 @dataclass
 class Ray:
-    PropagationDistance: float  # в метрах
-    RelativePower: float = 1.0  # можно задавать, если надо
+    PropagationDistance: float
+    RelativePower: float = 1.0
 
+# ===== Функции для GMSK =====
 def gaussian_filter(bt, sps, ntaps=4):
     n = ntaps * sps
     t = np.linspace(-ntaps/2, ntaps/2, n, endpoint=False)
@@ -56,56 +61,59 @@ def gaussian_filter(bt, sps, ntaps=4):
     h /= np.sum(h)
     return h
 
-def gmsk_modulate(bits):
+def gmsk_modulate(bits, sps=4, bt=0.3):
     nrz = 2 * np.array(bits, dtype=np.float32) - 1.0
-    phase = np.cumsum(nrz) * (np.pi/2)
-    signal = np.exp(1j * phase)
-    return signal
+    up = np.zeros(len(nrz) * sps)
+    up[::sps] = nrz
+    h = gaussian_filter(bt, sps, ntaps=4)
+    filtered = lfilter(h, 1.0, up)
+    phase = np.cumsum(filtered) * (np.pi/2) / sps
+    return np.exp(1j * phase)
 
 def add_awgn(signal, snr_db):
     signal_power = np.mean(np.abs(signal)**2)
     snr_linear = 10**(snr_db / 10)
     noise_power = signal_power / snr_linear
-    noise = np.sqrt(noise_power / 2) * (np.random.randn(len(signal)) + 1j*np.random.randn(len(signal)))
+    noise = np.sqrt(noise_power / 2) * (np.random.randn(len(signal)) + 1j * np.random.randn(len(signal)))
     return signal + noise
 
-def multipath(msg_complex, frequency, rays):
-    rays_quantity = len(rays)
-    CH_bandwidth = 200e3  # GSM канал 200 кГц!
-    duration_sample = 1 / CH_bandwidth
-    speed_light = 3e8
+def multipath(signal, frequency, rays, sps=4):
+    CH_BANDWIDTH = 200e3
+    SPEED_LIGHT = 3e8
     ray_distances = np.array([ray.PropagationDistance for ray in rays])
-    idx_min = np.argmin(ray_distances)
-    ray_distances = np.concatenate(([ray_distances[idx_min]], np.delete(ray_distances, idx_min)))
-    rays_sorted = [rays[idx_min]] + [rays[i] for i in range(len(rays)) if i != idx_min]
-    delays = np.zeros(rays_quantity, dtype=int)
-    for i in range(rays_quantity):
-        delay_seconds = (ray_distances[i] - ray_distances[0]) / speed_light
-        delays[i] = int(round(delay_seconds / duration_sample))
-    max_delay = delays.max()
-    data_with_delays = np.zeros((rays_quantity, len(msg_complex) + max_delay), dtype=complex)
-    for i in range(rays_quantity):
-        start_idx = delays[i]
-        end_idx = start_idx + len(msg_complex)
-        data_with_delays[i, start_idx:end_idx] = msg_complex * rays_sorted[i].RelativePower
-    return data_with_delays, ray_distances, rays_quantity
+    delays = np.round((ray_distances - ray_distances[0]) / SPEED_LIGHT / (1/(CH_BANDWIDTH*sps))).astype(int)
+    max_delay = delays[-1]
+    result = np.zeros(len(signal) + max_delay, dtype=complex)
+    for i, delay in enumerate(delays):
+        result[delay:delay+len(signal)] += signal * rays[i].RelativePower
+    return result[:len(signal)]
 
-def cost_hata(data_with_delays, tx_height, rx_height, ray_distances, frequency, rays_quantity):
-    data_PL = np.zeros_like(data_with_delays, dtype=complex)
-    for i in range(rays_quantity):
-        distance_km = max(ray_distances[i]/1000, 0.001)
-        a_height_rx = (1.1 * np.log10(frequency/1e6) - 0.7) * rx_height - (1.56 * np.log10(frequency/1e6) - 0.8)
-        PL = 46.3 + 33.9 * np.log10(frequency/1e6) - 13.82 * np.log10(tx_height) - a_height_rx + \
-             (44.9 - 6.55 * np.log10(tx_height)) * np.log10(distance_km)
-        attenuation = 10 ** (-PL / 20)
-        data_PL[i, :] = data_with_delays[i, :] * attenuation
-    return data_PL
+def cost_hata(signal, tx_height, rx_height, distance_km, frequency):
+    a_height_rx = (1.1 * np.log10(frequency/1e6) - 0.7) * rx_height - (1.56 * np.log10(frequency/1e6) - 0.8)
+    PL = 46.3 + 33.9 * np.log10(frequency/1e6) - 13.82 * np.log10(tx_height) - a_height_rx + \
+         (44.9 - 6.55 * np.log10(tx_height)) * np.log10(distance_km)
+    attenuation = 10 ** (-PL / 20)
+    return signal * attenuation
 
-def gmsk_differential_demod(samples, sps):
-    resampled = samples[sps//2::sps]
-    phase_diff = np.angle(resampled[1:] * np.conj(resampled[:-1]))
-    bits = (phase_diff > 0).astype(int)
-    return bits
+def matched_filter(rx, sps=4, bt=0.3, ntaps=4):
+    h = gaussian_filter(bt, sps, ntaps)
+    return lfilter(h[::-1], 1.0, rx)
+
+def differential_demod(signal):
+    phase_diff = np.angle(signal[1:] * np.conj(signal[:-1]))
+    return (phase_diff > 0).astype(np.uint8)
+
+def time_sync(ref_bits, rx_signal, sps=4, bt=0.3, ntaps=4):
+    """Точная временная синхронизация методом корреляции"""
+    ref_mod = gmsk_modulate(ref_bits, sps=sps, bt=bt)
+    h = gaussian_filter(bt, sps, ntaps)
+    ref_mf = lfilter(h[::-1], 1.0, ref_mod)
+    group_delay = len(h) // 2
+    ref_mf = ref_mf[group_delay:]
+    corr = correlate(rx_signal, ref_mf, mode='valid')
+    corr_norm = np.abs(corr) / np.sqrt(np.sum(np.abs(ref_mf)**2) * np.cumsum(np.abs(rx_signal)**2)[len(ref_mf)-1:])
+    offset = np.argmax(corr_norm)
+    return offset + group_delay, ref_mf
 
 
 class FakeTRX(Transceiver):
@@ -294,40 +302,76 @@ class FakeTRX(Transceiver):
 			self.data_if.send_msg(msg)
 			return
 
+		# --- НАЧАЛО РЕВОЛЮЦИОННОГО ПАЙПЛАЙНА ---
+		SNR_DB = 10
+		sps = 4
+		bt = 0.3
+		ts_len = min(20, len(src_msg.burst)//3)  # Для коротких burst
+
+		# Вытаскиваем из src_msg.burst массив бит
 		bit_array = np.array(list(map(int, src_msg.burst)), dtype=np.uint8)
 		N = len(bit_array)
 		print(f"[RAW] Burst bits: {bit_array.tolist()}")
 
-		# GMSK модуляция (sps=1)
-		modulated_signal = gmsk_modulate(bit_array)
-		print(f"[MOD] Burst bits: {modulated_signal.tolist()}")
+		# --- GMSK с фильтром ---
+		modulated_signal = gmsk_modulate(bit_array, sps=sps, bt=bt)
 
-		# Многолучёвый канал + Path Loss
-		rays = [
-			Ray(PropagationDistance=1000.0),
-			Ray(PropagationDistance=1200.0),
-			Ray(PropagationDistance=1500.0)
-		]
+		# --- Многолучёвость ---
+        # Многолучевой канал
 		frequency = 900e6
+		rays = [
+			Ray(PropagationDistance=1000.0, RelativePower=1.0),
+			Ray(PropagationDistance=1200.0, RelativePower=0.7),
+			Ray(PropagationDistance=1500.0, RelativePower=0.5)
+		]
+		signal_mp = multipath(modulated_signal, frequency, rays, sps=sps)
+
+		# Потери в тракте
 		tx_height = 30.0
 		rx_height = 1.5
-		data_with_delays, ray_distances, rays_quantity = multipath(modulated_signal, frequency, rays)
-		data_with_pathloss = cost_hata(data_with_delays, tx_height, rx_height, ray_distances, frequency, rays_quantity)
-		received_signal = np.sum(data_with_pathloss, axis=0)[:len(modulated_signal)]
+		distance_km = 1.5
+		signal_pl = cost_hata(signal_mp, tx_height, rx_height, distance_km, frequency)
 
+        # Добавление шума
 		SNR_DB = 10
-		noisy_signal = add_awgn(received_signal, snr_db=SNR_DB)
+		noisy_signal = add_awgn(signal_pl, SNR_DB)
 
-		# Демодуляция
-		phase_diff = np.angle(noisy_signal[1:] * np.conj(noisy_signal[:-1]))
-		demod = (phase_diff > 0).astype(np.uint8)
-		print(f"[DEMOD] Burst bits: {demod.tolist()}")
-		clen = min(N-1, len(demod))
-		ber = np.sum(bit_array[1:1+clen] != demod[:clen]) / clen
-		ber_inv = np.sum(1-bit_array[1:1+clen] != demod[:clen]) / clen
-		print("[BER]:", ber, "inv:", ber_inv)
+		# --- Matched filter ---
+		mf = matched_filter(noisy_signal, sps=sps, bt=bt)
 
-		time.sleep(100)
+		# --- Временная синхронизация по syncword (или по первым ts_len битам) ---
+		syncword = bit_array[:ts_len]
+		offset, ref_mf = time_sync(syncword, mf, sps=sps, bt=bt)
+		start_idx = max(0, offset - 2*sps)
+		end_idx = min(len(mf), start_idx + len(bit_array)*sps + 10*sps)
+		mf_sync = mf[start_idx:end_idx]
+
+		# --- Фазовая коррекция ---
+		ref_sync = gmsk_modulate(syncword, sps=sps, bt=bt)
+		rx_sync_segment = mf_sync[offset-start_idx:offset-start_idx+len(ref_sync)]
+		phase_offset = np.angle(np.sum(rx_sync_segment * np.conj(ref_sync)))
+		mf_corr = mf_sync * np.exp(-1j*phase_offset)
+
+		# --- Кубический ресемплинг ---
+		t_original = np.arange(len(mf_corr))
+		t_target = (offset - start_idx) + np.arange(0, len(bit_array)) * sps
+		I_spline = CubicSpline(t_original, mf_corr.real)
+		Q_spline = CubicSpline(t_original, mf_corr.imag)
+		resampled = I_spline(t_target) + 1j*Q_spline(t_target)
+
+		# --- Дифференциальная демодуляция ---
+		demod = differential_demod(resampled)
+
+		# --- BER только по полезной нагрузке ---
+		payload_tx = bit_array[ts_len+1:]
+		payload_rx = demod[ts_len:ts_len+len(payload_tx)]
+		if len(payload_tx) > 0 and len(payload_rx) == len(payload_tx):
+			ber = np.sum(payload_tx != payload_rx) / len(payload_tx)
+		else:
+			ber = 1.0
+		print(f"[BER]: {ber:.5f} (payload len: {len(payload_tx)})")
+
+		#time.sleep(100)
 
 		msg.toa256 = self.toa256
 		if not self.fake_rssi_enabled:
