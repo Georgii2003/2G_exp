@@ -78,7 +78,7 @@ def add_awgn(signal, snr_db):
     return signal + noise
 
 def multipath(signal, frequency, rays, sps=4):
-    CH_BANDWIDTH = 200e3
+    CH_BANDWIDTH = 5e3
     SPEED_LIGHT = 3e8
     ray_distances = np.array([ray.PropagationDistance for ray in rays])
     delays = np.round((ray_distances - ray_distances[0]) / SPEED_LIGHT / (1/(CH_BANDWIDTH*sps))).astype(int)
@@ -86,6 +86,9 @@ def multipath(signal, frequency, rays, sps=4):
     result = np.zeros(len(signal) + max_delay, dtype=complex)
     for i, delay in enumerate(delays):
         result[delay:delay+len(signal)] += signal * rays[i].RelativePower
+    # Нормализация мощности сигнала
+    total_power = sum(ray.RelativePower for ray in rays)
+    result /= total_power  # Деление на суммарную мощность всех лучей
     return result[:len(signal)]
 
 def cost_hata(signal, tx_height, rx_height, distance_km, frequency):
@@ -303,7 +306,6 @@ class FakeTRX(Transceiver):
 			return
 
 		# --- НАЧАЛО РЕВОЛЮЦИОННОГО ПАЙПЛАЙНА ---
-		SNR_DB = 10
 		sps = 4
 		bt = 0.3
 		ts_len = min(20, len(src_msg.burst)//3)  # Для коротких burst
@@ -321,8 +323,15 @@ class FakeTRX(Transceiver):
 		frequency = 900e6
 		rays = [
 			Ray(PropagationDistance=1000.0, RelativePower=1.0),
-			Ray(PropagationDistance=1200.0, RelativePower=0.7),
-			Ray(PropagationDistance=1500.0, RelativePower=0.5)
+			Ray(PropagationDistance=2500.0, RelativePower=0.8),
+			Ray(PropagationDistance=3000.0, RelativePower=0.6),
+			Ray(PropagationDistance=4500.0, RelativePower=0.5),
+			Ray(PropagationDistance=5000.0, RelativePower=0.5),
+			Ray(PropagationDistance=6500.0, RelativePower=0.3),
+			Ray(PropagationDistance=7000.0, RelativePower=0.25),
+			Ray(PropagationDistance=8500.0, RelativePower=0.2),
+			Ray(PropagationDistance=9000.0, RelativePower=0.15),
+			Ray(PropagationDistance=10500.0, RelativePower=0.1)
 		]
 		signal_mp = multipath(modulated_signal, frequency, rays, sps=sps)
 
@@ -369,9 +378,10 @@ class FakeTRX(Transceiver):
 			ber = np.sum(payload_tx != payload_rx) / len(payload_tx)
 		else:
 			ber = 1.0
+		print(f"[RAW] Burst Demod bits: {demod.tolist()}")
 		print(f"[BER]: {ber:.5f} (payload len: {len(payload_tx)})")
 
-		#time.sleep(100)
+		# time.sleep(100)
 
 		msg.toa256 = self.toa256
 		if not self.fake_rssi_enabled:
@@ -384,7 +394,6 @@ class FakeTRX(Transceiver):
 			msg.toa256 -= src_trx.ta * 256
 
 		Transceiver.handle_data_msg(self, msg)
-
 
 
 	# Simulation specific CTRL command handler
