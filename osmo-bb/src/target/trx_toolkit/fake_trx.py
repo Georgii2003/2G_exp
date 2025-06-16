@@ -1,22 +1,3 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-
-# TRX Toolkit
-# Virtual Um-interface (fake transceiver)
-#
-# (C) 2017-2019 by Vadim Yanitskiy <axilirator@gmail.com>
-#
-# All Rights Reserved
-#
-# This program is free software; you can redistribute it and/or modify
-# it under the terms of the GNU General Public License as published by
-# the Free Software Foundation; either version 2 of the License, or
-# (at your option) any later version.
-#
-# This program is distributed in the hope that it will be useful,
-# but WITHOUT ANY WARRANTY; without even the implied warranty of
-# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-# GNU General Public License for more details.
 
 APP_CR_HOLDERS = [("2017-2019", "Vadim Yanitskiy <axilirator@gmail.com>")]
 
@@ -118,6 +99,18 @@ def time_sync(ref_bits, rx_signal, sps=4, bt=0.3, ntaps=4):
     offset = np.argmax(corr_norm)
     return offset + group_delay, ref_mf
 
+def add_awgn_fixed_noise(signal, noise_power_mw):
+    """Добавить к сигналу комплексный AWGN с заданной мощностью (мВт)"""
+    noise = np.sqrt(noise_power_mw / 2) * (np.random.randn(len(signal)) + 1j * np.random.randn(len(signal)))
+    return signal + noise
+
+def receiver_noise_power(BW, NF_dB=7):
+    """Расчет реальной шумовой мощности приемника"""
+    k = 1.38e-23
+    T = 290
+    noise_w = k * T * BW
+    noise_w *= 10**(NF_dB/10)
+    return noise_w
 
 class FakeTRX(Transceiver):
 	""" Fake transceiver with RF path (burst loss, RSSI, TA, ToA) simulation.
@@ -218,6 +211,15 @@ class FakeTRX(Transceiver):
 
 			# Переменная для хранения сырых данных
 			self.raw_data = None
+			self.tx_power_dbm = 43       # Мощность передачи БС в dBm (20 Вт)
+			self.tx_gain_db = 15         # Усиление антенны БС в dB
+			self.rx_gain_db = 3          # Усиление антенны телефона в dB
+			self.nf_db = 7               # Шумовая фигура приемника в dB
+			self.tx_height = 50          # Высота БС в метрах
+			self.rx_height = 1.5         # Высота телефона в метрах
+			self.freq = 900e6            # Частота в Гц (GSM-900)
+			self.bw = 200e3              # Ширина полосы в Гц (GSM)
+			self.distance_km = 5       # Дистанция между БС и телефоном в км
 
 	@property
 	def toa256(self):
@@ -308,18 +310,24 @@ class FakeTRX(Transceiver):
 		# Начало нашей работы
 		sps = 4
 		bt = 0.3
-		ts_len = min(20, len(src_msg.burst)//3)  # Для коротких burst
+		ts_len = min(20, len(src_msg.burst)//3)  # Для short burst
 
 		# Вытаскиваем из src_msg.burst массив бит
 		bit_array = np.array(list(map(int, src_msg.burst)), dtype=np.uint8)
 		N = len(bit_array)
 		print(f"[RAW] Burst bits: {bit_array.tolist()}")
 
-		# GMSK с фильтром
+		# Модуляция GMSK
+		sps = 4
+		bt = 0.3
 		modulated_signal = gmsk_modulate(bit_array, sps=sps, bt=bt)
 
-		# Многолучёвость
-		frequency = 900e6
+		# Применяем мощность передачи и усиление антенны БС
+		tx_power_mw = 10**(self.tx_power_dbm / 10) * 10**(self.tx_gain_db / 10)
+		modulated_signal = modulated_signal * np.sqrt(tx_power_mw)
+
+		# Многолучевой канал (multipath)
+		frequency = self.freq
 		rays = [
 			Ray(PropagationDistance=1000.0, RelativePower=1.0),
 			Ray(PropagationDistance=2500.0, RelativePower=0.8),
@@ -332,22 +340,31 @@ class FakeTRX(Transceiver):
 			Ray(PropagationDistance=9000.0, RelativePower=0.15),
 			Ray(PropagationDistance=10500.0, RelativePower=0.1)
 		]
-		signal_mp = multipath(modulated_signal, frequency, rays, sps=sps)
+		# Сначала затухание в тракте (path loss) и усиление антенны телефона
+		signal_pl = cost_hata(modulated_signal, self.tx_height, self.rx_height, self.distance_km, frequency)
+		signal_pl = signal_pl * 10**(self.rx_gain_db / 20)
 
-		# Потери (PL)
-		tx_height = 30.0
-		rx_height = 1.5
-		distance_km = 1.5
-		signal_pl = cost_hata(signal_mp, tx_height, rx_height, distance_km, frequency)
+		# Затем моделируем многолучёвость (multipath)
+		signal_mp = multipath(signal_pl, frequency, rays, sps=sps)
 
-       		# Добавление шума
-		SNR_DB = 10
-		noisy_signal = add_awgn(signal_pl, SNR_DB)
+		# Шумовая мощность приемника (мВт)
+		noise_power_w = receiver_noise_power(self.bw, NF_dB=self.nf_db)
+		noise_power_mw = noise_power_w * 1e3
 
-		# Matched filter
+		# Оценка SNR на приёмнике
+		signal_power = np.mean(np.abs(signal_pl) ** 2)
+		snr_linear = signal_power / noise_power_mw
+		snr_db = 10 * np.log10(snr_linear)
+		print(f"[SNR] Дистанция = {self.distance_km} км, SNR = {snr_db:.2f} дБ")
+
+		# Добавление шума с рассчитанной мощностью
+		noisy_signal = add_awgn_fixed_noise(signal_pl, noise_power_mw)
+
+		# Matched filter (выделение огибающей)
 		mf = matched_filter(noisy_signal, sps=sps, bt=bt)
 
 		# Временная синхронизация по syncword (или по первым ts_len битам)
+		ts_len = min(20, len(src_msg.burst)//3)
 		syncword = bit_array[:ts_len]
 		offset, ref_mf = time_sync(syncword, mf, sps=sps, bt=bt)
 		start_idx = max(0, offset - 2*sps)
@@ -360,7 +377,7 @@ class FakeTRX(Transceiver):
 		phase_offset = np.angle(np.sum(rx_sync_segment * np.conj(ref_sync)))
 		mf_corr = mf_sync * np.exp(-1j*phase_offset)
 
-		# Кубический ресемплинг
+		# Кубический ресемплинг символов)
 		t_original = np.arange(len(mf_corr))
 		t_target = (offset - start_idx) + np.arange(0, len(bit_array)) * sps
 		I_spline = CubicSpline(t_original, mf_corr.real)
@@ -370,7 +387,7 @@ class FakeTRX(Transceiver):
 		# Дифференциальная демодуляция
 		demod = differential_demod(resampled)
 
-		# BER только по полезной нагрузке
+		# BER только по полезной нагрузке (payload)
 		payload_tx = bit_array[ts_len+1:]
 		payload_rx = demod[ts_len:ts_len+len(payload_tx)]
 		if len(payload_tx) > 0 and len(payload_rx) == len(payload_tx):
@@ -380,7 +397,7 @@ class FakeTRX(Transceiver):
 		print(f"[RAW] Burst Demod bits: {demod.tolist()}")
 		print(f"[BER]: {ber:.5f} (payload len: {len(payload_tx)})")
 
-		# time.sleep(100)
+		#time.sleep(100)
 		# Конец нашей работы
 
 		msg.toa256 = self.toa256

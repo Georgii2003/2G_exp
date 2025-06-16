@@ -3,6 +3,7 @@ from dataclasses import dataclass
 import matplotlib.pyplot as plt
 from scipy.signal import lfilter, correlate
 from scipy.interpolate import CubicSpline
+import matplotlib.ticker as mticker
 
 # ===== Конфигурация канала =====
 @dataclass
@@ -42,8 +43,15 @@ def multipath(signal, frequency, rays, sps=4):
     delays = np.round((ray_distances - ray_distances[0]) / SPEED_LIGHT / (1/(CH_BANDWIDTH*sps))).astype(int)
     max_delay = delays[-1]
     result = np.zeros(len(signal) + max_delay, dtype=complex)
+    
+    # Суммирование лучей
     for i, delay in enumerate(delays):
         result[delay:delay+len(signal)] += signal * rays[i].RelativePower
+
+    # Нормализация мощности сигнала
+    total_power = sum(ray.RelativePower for ray in rays)
+    result /= total_power  # Деление на суммарную мощность всех лучей
+
     return result[:len(signal)]
 
 def cost_hata(signal, tx_height, rx_height, distance_km, frequency):
@@ -82,14 +90,40 @@ def plot_bitstream(bits, title="Bitstream"):
     plt.ylabel("Значение")
     plt.ylim(-0.1, 1.1)
 
-def plot_signal(signal, title="Сигнал"):
+def plot_signal(signal, title="Сигнал", zoom=None, ylim=None):
     plt.figure(figsize=(12, 4))
-    plt.plot(np.real(signal), label="I (реальная часть)")
-    plt.plot(np.imag(signal), label="Q (мнимая часть)")
+    if zoom:
+        plt.plot(np.real(signal)[:zoom], label="I (реальная часть)")
+        plt.plot(np.imag(signal)[:zoom], label="Q (мнимая часть)")
+    else:
+        plt.plot(np.real(signal), label="I (реальная часть)")
+        plt.plot(np.imag(signal), label="Q (мнимая часть)")
     plt.title(title)
     plt.xlabel("Отсчеты")
     plt.ylabel("Амплитуда")
     plt.legend()
+    plt.grid(True)
+    if ylim is not None:
+        plt.ylim(*ylim)
+    ax = plt.gca()
+    formatter = mticker.FuncFormatter(lambda x, pos: '{:.1e}'.format(x))
+    ax.yaxis.set_major_formatter(formatter)
+
+def plot_signal_zoom(signal, title="Сигнал", zoom=None, ylim=None):
+    plt.figure(figsize=(12, 4))
+    if zoom:
+        plt.plot(np.real(signal)[:zoom], label="I (реальная часть)")
+        plt.plot(np.imag(signal)[:zoom], label="Q (мнимая часть)")
+    else:
+        plt.plot(np.real(signal), label="I (реальная часть)")
+        plt.plot(np.imag(signal), label="Q (мнимая часть)")
+    plt.title(title)
+    plt.xlabel("Отсчеты")
+    plt.ylabel("Амплитуда")
+    plt.legend()
+    plt.grid(True)
+    if ylim is not None:
+        plt.ylim(*ylim)  # Установка диапазона Y
 
 def plot_constellation(signal, title="Созвездие", subsample=1):
     plt.figure(figsize=(6, 6))
@@ -98,13 +132,14 @@ def plot_constellation(signal, title="Созвездие", subsample=1):
     plt.xlabel("I (реальная часть)")
     plt.ylabel("Q (мнимая часть)")
     plt.grid(True)
+    
 
 # ===== Основной пайплайн =====
 def main():
     np.random.seed(42)
-    N_BITS = 148
+    N_BITS = 1480
     SNR_DB = 10
-    TX_HEIGHT = 30.0
+    TX_HEIGHT = 300.0
     RX_HEIGHT = 1.5
     FREQUENCY = 900e6
     sps = 4
@@ -116,32 +151,70 @@ def main():
     payload = np.random.randint(0, 2, N_BITS)
     bits_full = np.concatenate([syncword, payload])
     print(f"[RAW] Sync+Payload биты: {bits_full.tolist()}")
-    plot_bitstream(bits_full, title="Исходные биты (с синхрословом)")
+    # plot_bitstream(bits_full, title="Исходные биты (с синхрословом)")
 
     # GMSK модуляция
     modulated = gmsk_modulate(bits_full, sps=sps, bt=bt)
-    plot_signal(modulated, title="Модулированный сигнал")
-    plot_constellation(modulated, title="Созвездие после модуляции", subsample=sps)
+    # plot_constellation(modulated, title="Созвездие после модуляции", subsample=sps)
 
-    # Многолучевой канал
+    # Многолучевой канал с 10 лучами
     rays = [
         Ray(PropagationDistance=1000.0, RelativePower=1.0),
-        Ray(PropagationDistance=1200.0, RelativePower=0.7),
-        Ray(PropagationDistance=1500.0, RelativePower=0.5)
+        Ray(PropagationDistance=2500.0, RelativePower=0.8),
+        Ray(PropagationDistance=3000.0, RelativePower=0.6),
+        Ray(PropagationDistance=4500.0, RelativePower=0.5),
+        Ray(PropagationDistance=5000.0, RelativePower=0.5),
+        Ray(PropagationDistance=6500.0, RelativePower=0.3),
+        Ray(PropagationDistance=7000.0, RelativePower=0.25),
+        Ray(PropagationDistance=8500.0, RelativePower=0.2),
+        Ray(PropagationDistance=9000.0, RelativePower=0.15),
+        Ray(PropagationDistance=10500.0, RelativePower=0.1)
     ]
-    multipath_signal = multipath(modulated, FREQUENCY, rays, sps=sps)
-    plot_signal(multipath_signal, title="После многолучевого канала")
-    plot_constellation(multipath_signal, title="Созвездие после многолучевости", subsample=sps)
+    
+    # Анализ задержек
+    CH_BANDWIDTH = 10e3
+    SPEED_LIGHT = 3e8
+    ray_distances = np.array([ray.PropagationDistance for ray in rays])
+    delays = np.round((ray_distances - ray_distances[0]) / SPEED_LIGHT / (1/(CH_BANDWIDTH*sps))).astype(int)
+    
+    print("\n[МНОГОЛУЧЕВОСТЬ] Анализ задержек:")
+    print(f"Скорость света: {SPEED_LIGHT} м/с")
+    print(f"Длительность отсчета: {1/(CH_BANDWIDTH*sps)*1e6:.2f} мкс")
+    print(f"Расстояние на отсчет: {SPEED_LIGHT/(CH_BANDWIDTH*sps):.0f} м")
+    print("Лучи и их задержки:")
+    for i, ray in enumerate(rays):
+        delay_us = (ray.PropagationDistance - ray_distances[0]) / SPEED_LIGHT * 1e6
+        print(f"  - Луч {i+1}: расстояние={ray.PropagationDistance:.0f} м, "
+              f"относит. мощность={ray.RelativePower:.2f}, "
+              f"задержка={delay_us:.2f} мкс, "
+              f"отсчетов={delays[i]}")
 
-    # Path loss
-    received_signal = cost_hata(multipath_signal, TX_HEIGHT, RX_HEIGHT, 1.5, FREQUENCY)
-    plot_signal(received_signal, title="После path loss")
-    plot_constellation(received_signal, title="Созвездие после path loss", subsample=sps)
+    Y_LIM = (-2 * 1e-7, 2 * 1e-7)
+    
+    # ===== ИЗМЕНЕНИЯ НАЧИНАЮТСЯ ЗДЕСЬ =====
+    # Добавление мощности передачи 40 дБм (10 Вт)
+    tx_power_dbm = 40  # 40 дБм
+    tx_power_w = 10**(tx_power_dbm / 10)  # Преобразование в милливатты (10000 мВт)
+    modulated_tx = modulated * np.sqrt(tx_power_w)  # Умножаем амплитуду на sqrt(мощность)
+    plot_signal_zoom(modulated_tx, title="Модулированный сигнал")
+    
+    # Сначала применяем потери в тракте (path loss)
+    distance_km = 1.5  # Расстояние в километрах
+    received_pl = cost_hata(modulated_tx, TX_HEIGHT, RX_HEIGHT, distance_km, FREQUENCY)
+    plot_signal_zoom(received_pl, title="После path loss (Cost-Hata)", ylim=(-0.002, 0.002))
+    # plot_constellation(received_pl, title="Созвездие после path loss", subsample=sps)
 
+    # Затем применяем многолучевость
+    received_mp = multipath(received_pl, FREQUENCY, rays, sps=sps)
+    plot_signal_zoom(received_mp, title="После многолучевого канала")
+    # plot_constellation(received_mp, title="Созвездие после многолучевости", subsample=sps)
+    
     # AWGN
-    noisy_signal = add_awgn(received_signal, SNR_DB)
-    plot_signal(noisy_signal, title="После AWGN")
-    plot_constellation(noisy_signal, title="Созвездие после AWGN", subsample=sps)
+    noisy_signal = add_awgn(received_mp, SNR_DB)
+    # ===== ИЗМЕНЕНИЯ ЗАКАНЧИВАЮТСЯ ЗДЕСЬ =====
+    
+    plot_signal_zoom(noisy_signal, title="После AWGN")
+    # plot_constellation(noisy_signal, title="Созвездие после AWGN", subsample=sps)
 
     # Matched filter
     mf = matched_filter(noisy_signal, sps=sps, bt=bt)
@@ -164,27 +237,23 @@ def main():
     I_spline = CubicSpline(t_original, mf_corr.real)
     Q_spline = CubicSpline(t_original, mf_corr.imag)
     resampled = I_spline(t_target) + 1j*Q_spline(t_target)
-    plot_constellation(resampled, title="Созвездие после ресемплинга", subsample=1)
+    # plot_constellation(resampled, title="Созвездие после ресемплинга", subsample=1)
 
     # Демодуляция
     demod_bits = differential_demod(resampled)
-    plot_bitstream(demod_bits, title="Демодулированные биты")
+    plot_signal_zoom(demod_bits, title="Демодулированные биты")
+    # plot_bitstream(demod_bits, title="Демодулированные биты")
 
     # BER (только payload)
     payload_tx = bits_full[ts_len+1:]        # +1 из-за дифференциальной демодуляции
     payload_rx = demod_bits[ts_len:ts_len+len(payload_tx)]
-    ber = np.sum(payload_tx != payload_rx) / len(payload_tx)
-    print(f"[BER]: {ber:.4f} (длина полезной нагрузки: {len(payload_tx)} бит)")
+    errors = np.sum(payload_tx != payload_rx)
+    ber = errors / len(payload_tx) if len(payload_tx) > 0 else 0
+    print(f"\n[BER]: {ber:.4f} (ошибок: {errors}/{len(payload_tx)})")
 
+    plt.tight_layout()
     plt.show()
 
 # ===== Запуск =====
 if __name__ == "__main__":
     main()
-
-
-
-
-
-
-

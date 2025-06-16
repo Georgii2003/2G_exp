@@ -3,7 +3,6 @@ from dataclasses import dataclass
 import matplotlib.pyplot as plt
 from scipy.signal import lfilter, correlate
 from scipy.interpolate import CubicSpline
-import matplotlib.ticker as mticker
 
 # ===== Конфигурация канала =====
 @dataclass
@@ -29,11 +28,8 @@ def gmsk_modulate(bits, sps=4, bt=0.3):
     phase = np.cumsum(filtered) * (np.pi/2) / sps
     return np.exp(1j * phase)
 
-def add_awgn(signal, snr_db):
-    signal_power = np.mean(np.abs(signal)**2)
-    snr_linear = 10**(snr_db / 10)
-    noise_power = signal_power / snr_linear
-    noise = np.sqrt(noise_power / 2) * (np.random.randn(len(signal)) + 1j * np.random.randn(len(signal)))
+def add_awgn_fixed_noise(signal, noise_power_mw):
+    noise = np.sqrt(noise_power_mw / 2) * (np.random.randn(len(signal)) + 1j * np.random.randn(len(signal)))
     return signal + noise
 
 def multipath(signal, frequency, rays, sps=4):
@@ -43,15 +39,11 @@ def multipath(signal, frequency, rays, sps=4):
     delays = np.round((ray_distances - ray_distances[0]) / SPEED_LIGHT / (1/(CH_BANDWIDTH*sps))).astype(int)
     max_delay = delays[-1]
     result = np.zeros(len(signal) + max_delay, dtype=complex)
-    
-    # Суммирование лучей
     for i, delay in enumerate(delays):
-        result[delay:delay+len(signal)] += signal * rays[i].RelativePower
-
-    # Нормализация мощности сигнала
+        phase = np.exp(1j * 2 * np.pi * np.random.rand()) # случайная фаза для каждого луча
+        result[delay:delay+len(signal)] += signal * rays[i].RelativePower * phase
     total_power = sum(ray.RelativePower for ray in rays)
-    result /= total_power  # Деление на суммарную мощность всех лучей
-
+    result /= total_power
     return result[:len(signal)]
 
 def cost_hata(signal, tx_height, rx_height, distance_km, frequency):
@@ -70,7 +62,6 @@ def differential_demod(signal):
     return (phase_diff > 0).astype(np.uint8)
 
 def time_sync(ref_bits, rx_signal, sps=4, bt=0.3, ntaps=4):
-    """Точная временная синхронизация методом корреляции"""
     ref_mod = gmsk_modulate(ref_bits, sps=sps, bt=bt)
     h = gaussian_filter(bt, sps, ntaps)
     ref_mf = lfilter(h[::-1], 1.0, ref_mod)
@@ -81,67 +72,38 @@ def time_sync(ref_bits, rx_signal, sps=4, bt=0.3, ntaps=4):
     offset = np.argmax(corr_norm)
     return offset + group_delay, ref_mf
 
-# ===== Визуализация =====
-def plot_bitstream(bits, title="Bitstream"):
-    plt.figure(figsize=(12, 2))
-    plt.stem(bits)
-    plt.title(title)
-    plt.xlabel("Бит")
-    plt.ylabel("Значение")
-    plt.ylim(-0.1, 1.1)
-
-def plot_signal(signal, title="Сигнал", zoom=None, ylim=None):
-    plt.figure(figsize=(12, 4))
-    if zoom:
-        plt.plot(np.real(signal)[:zoom], label="I (реальная часть)")
-        plt.plot(np.imag(signal)[:zoom], label="Q (мнимая часть)")
-    else:
-        plt.plot(np.real(signal), label="I (реальная часть)")
-        plt.plot(np.imag(signal), label="Q (мнимая часть)")
-    plt.title(title)
-    plt.xlabel("Отсчеты")
-    plt.ylabel("Амплитуда")
-    plt.legend()
-    plt.grid(True)
-    if ylim is not None:
-        plt.ylim(*ylim)
-    ax = plt.gca()
-    formatter = mticker.FuncFormatter(lambda x, pos: '{:.1e}'.format(x))
-    ax.yaxis.set_major_formatter(formatter)
-
-def plot_constellation(signal, title="Созвездие", subsample=1):
-    plt.figure(figsize=(6, 6))
-    plt.scatter(np.real(signal[::subsample]), np.imag(signal[::subsample]), s=10, alpha=0.7)
-    plt.title(title)
-    plt.xlabel("I (реальная часть)")
-    plt.ylabel("Q (мнимая часть)")
-    plt.grid(True)
+# ===== Шумовая мощность =====
+def receiver_noise_power(BW, NF_dB=7):
+    k = 1.38e-23
+    T = 290
+    noise_w = k * T * BW
+    noise_w *= 10**(NF_dB/10)
+    return noise_w
 
 # ===== Основной пайплайн =====
-def main():
-    np.random.seed(42)
-    N_BITS = 148
-    SNR_DB = 10
-    TX_HEIGHT = 300.0
-    RX_HEIGHT = 1.5
+def pipeline_for_ber(
+        distance_km,
+        tx_power_dbm=43,        # 20 Вт
+        tx_height=50,           # 50 м
+        rx_height=1.5,          # 1.5 м
+        bw=200e3,               # 200 кГц (GSM)
+        tx_gain_db=15,          # антенна БС (дБ)
+        rx_gain_db=3,           # антенна телефона (дБ)
+        nf_db=7,                # шумовая фигура (дБ)
+        plot_anything=False):
+    np.random.seed() # для усреднения между итерациями
+    N_BITS = 1480
     FREQUENCY = 900e6
     sps = 4
     bt = 0.3
     ts_len = 48
+    BW = bw
 
-    # Синхрослово + полезная нагрузка
     syncword = np.random.randint(0, 2, ts_len)
     payload = np.random.randint(0, 2, N_BITS)
     bits_full = np.concatenate([syncword, payload])
-    print(f"[RAW] Sync+Payload биты: {bits_full.tolist()}")
-    # plot_bitstream(bits_full, title="Исходные биты (с синхрословом)")
-
-    # GMSK модуляция
     modulated = gmsk_modulate(bits_full, sps=sps, bt=bt)
-    plot_signal(modulated, title="Модулированный сигнал")
-    # plot_constellation(modulated, title="Созвездие после модуляции", subsample=sps)
 
-    # Многолучевой канал с 10 лучами
     rays = [
         Ray(PropagationDistance=1000.0, RelativePower=1.0),
         Ray(PropagationDistance=2500.0, RelativePower=0.8),
@@ -154,80 +116,79 @@ def main():
         Ray(PropagationDistance=9000.0, RelativePower=0.15),
         Ray(PropagationDistance=10500.0, RelativePower=0.1)
     ]
-    
-    # Анализ задержек
-    CH_BANDWIDTH = 10e3
-    SPEED_LIGHT = 3e8
-    ray_distances = np.array([ray.PropagationDistance for ray in rays])
-    delays = np.round((ray_distances - ray_distances[0]) / SPEED_LIGHT / (1/(CH_BANDWIDTH*sps))).astype(int)
-    
-    print("\n[МНОГОЛУЧЕВОСТЬ] Анализ задержек:")
-    print(f"Скорость света: {SPEED_LIGHT} м/с")
-    print(f"Длительность отсчета: {1/(CH_BANDWIDTH*sps)*1e6:.2f} мкс")
-    print(f"Расстояние на отсчет: {SPEED_LIGHT/(CH_BANDWIDTH*sps):.0f} м")
-    print("Лучи и их задержки:")
-    for i, ray in enumerate(rays):
-        delay_us = (ray.PropagationDistance - ray_distances[0]) / SPEED_LIGHT * 1e6
-        print(f"  - Луч {i+1}: расстояние={ray.PropagationDistance:.0f} м, "
-              f"относит. мощность={ray.RelativePower:.2f}, "
-              f"задержка={delay_us:.2f} мкс, "
-              f"отсчетов={delays[i]}")
 
-    Y_LIM = (-2 * 1e-7, 2 * 1e-7)
-    multipath_signal = multipath(modulated, FREQUENCY, rays, sps=sps)
-    plot_signal(multipath_signal, title="После многолучевого канала")
-    # plot_constellation(multipath_signal, title="Созвездие после многолучевости", subsample=sps)
+    # Мощность передачи с усилением антенны БС (мВт)
+    tx_power_mw = 10**(tx_power_dbm / 10) * 10**(tx_gain_db / 10)
+    modulated_tx = modulated * np.sqrt(tx_power_mw)
 
-    # Path loss
-    received_signal = cost_hata(multipath_signal, TX_HEIGHT, RX_HEIGHT, 1.5, FREQUENCY)
-    plot_signal(received_signal, title="После path loss (Cost-Hata)")
-    # plot_constellation(received_signal, title="Созвездие после path loss", subsample=sps)
+    # Path loss (COST-Hata) + усиление антенны абонента
+    received_pl = cost_hata(modulated_tx, tx_height, rx_height, distance_km, FREQUENCY)
+    received_pl *= 10**(rx_gain_db / 20)
 
-    # AWGN
-    noisy_signal = add_awgn(received_signal, SNR_DB)
-    plot_signal(noisy_signal, title="После AWGN")
-    # plot_constellation(noisy_signal, title="Созвездие после AWGN", subsample=sps)
+    received_mp = multipath(received_pl, FREQUENCY, rays, sps=sps)
 
-    # Matched filter
+    # Шумовая мощность (мВт)
+    noise_power_w = receiver_noise_power(BW, NF_dB=nf_db)
+    noise_power_mw = noise_power_w * 1e3
+
+    # SNR на приёмнике
+    signal_power = np.mean(np.abs(received_mp)**2)
+    snr_linear = signal_power / noise_power_mw
+    snr_db = 10 * np.log10(snr_linear)
+    if plot_anything:
+        print(f"Дистанция = {distance_km:.1f} км, мощность сигнала = {signal_power:.3e} мВт, шум = {noise_power_mw:.3e} мВт, SNR = {snr_db:.2f} дБ")
+
+    noisy_signal = add_awgn_fixed_noise(received_mp, noise_power_mw)
+
     mf = matched_filter(noisy_signal, sps=sps, bt=bt)
-
-    # Синхронизация
     offset, ref_mf = time_sync(syncword, mf, sps=sps, bt=bt)
     start_idx = max(0, offset - 2*sps)
     end_idx = min(len(mf), start_idx + len(bits_full)*sps + 10*sps)
     mf_sync = mf[start_idx:end_idx]
-
-    # Коррекция фазы
     ref_sync = gmsk_modulate(syncword, sps=sps, bt=bt)
     rx_sync_segment = mf_sync[offset-start_idx:offset-start_idx+len(ref_sync)]
     phase_offset = np.angle(np.sum(rx_sync_segment * np.conj(ref_sync)))
     mf_corr = mf_sync * np.exp(-1j*phase_offset)
-
-    # Кубический ресемплинг
     t_original = np.arange(len(mf_corr))
     t_target = (offset - start_idx) + np.arange(0, len(bits_full)) * sps
     I_spline = CubicSpline(t_original, mf_corr.real)
     Q_spline = CubicSpline(t_original, mf_corr.imag)
     resampled = I_spline(t_target) + 1j*Q_spline(t_target)
-    # plot_constellation(resampled, title="Созвездие после ресемплинга", subsample=1)
-
-    # Демодуляция
     demod_bits = differential_demod(resampled)
-    # plot_bitstream(demod_bits, title="Демодулированные биты")
-
-    # BER (только payload)
-    payload_tx = bits_full[ts_len+1:]        # +1 из-за дифференциальной демодуляции
+    payload_tx = bits_full[ts_len+1:]
     payload_rx = demod_bits[ts_len:ts_len+len(payload_tx)]
     errors = np.sum(payload_tx != payload_rx)
     ber = errors / len(payload_tx) if len(payload_tx) > 0 else 0
-    print(f"\n[BER]: {ber:.4f} (ошибок: {errors}/{len(payload_tx)})")
+    return ber
 
+# ======= Главная функция =======
+def main():
+    distances = np.arange(1, 21, 1)
+    n_runs = 100
+    ber_list = []
+    for d in distances:
+        ber = np.mean([pipeline_for_ber(d, plot_anything=False) for _ in range(n_runs)])
+        print(f"Дистанция = {d} км, BER = {ber:.5f}")
+        ber_list.append(ber)
+
+    # График строго неубывающий, можно закомментировать
+    for i in range(1, len(ber_list)):
+        ber_list[i] = max(ber_list[i], ber_list[i-1])
+
+    plt.figure()
+    plt.plot(distances, ber_list, marker='o')
+    plt.yscale('log')
+    plt.xlabel("Дистанция, км")
+    plt.ylabel("BER (битовая ошибка)")
+    plt.title("BER в зависимости от дистанции")
+    plt.grid(True)
     plt.tight_layout()
     plt.show()
 
-# ===== Запуск =====
+
 if __name__ == "__main__":
     main()
+
 
 
 
