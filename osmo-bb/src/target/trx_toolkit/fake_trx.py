@@ -305,7 +305,7 @@ class FakeTRX(Transceiver):
 			self.data_if.send_msg(msg)
 			return
 
-		# --- НАЧАЛО РЕВОЛЮЦИОННОГО ПАЙПЛАЙНА ---
+		# Начало нашей работы
 		sps = 4
 		bt = 0.3
 		ts_len = min(20, len(src_msg.burst)//3)  # Для коротких burst
@@ -315,11 +315,10 @@ class FakeTRX(Transceiver):
 		N = len(bit_array)
 		print(f"[RAW] Burst bits: {bit_array.tolist()}")
 
-		# --- GMSK с фильтром ---
+		# GMSK с фильтром
 		modulated_signal = gmsk_modulate(bit_array, sps=sps, bt=bt)
 
-		# --- Многолучёвость ---
-        # Многолучевой канал
+		# Многолучёвость
 		frequency = 900e6
 		rays = [
 			Ray(PropagationDistance=1000.0, RelativePower=1.0),
@@ -335,43 +334,43 @@ class FakeTRX(Transceiver):
 		]
 		signal_mp = multipath(modulated_signal, frequency, rays, sps=sps)
 
-		# Потери в тракте
+		# Потери (PL)
 		tx_height = 30.0
 		rx_height = 1.5
 		distance_km = 1.5
 		signal_pl = cost_hata(signal_mp, tx_height, rx_height, distance_km, frequency)
 
-        # Добавление шума
+       		# Добавление шума
 		SNR_DB = 10
 		noisy_signal = add_awgn(signal_pl, SNR_DB)
 
-		# --- Matched filter ---
+		# Matched filter
 		mf = matched_filter(noisy_signal, sps=sps, bt=bt)
 
-		# --- Временная синхронизация по syncword (или по первым ts_len битам) ---
+		# Временная синхронизация по syncword (или по первым ts_len битам)
 		syncword = bit_array[:ts_len]
 		offset, ref_mf = time_sync(syncword, mf, sps=sps, bt=bt)
 		start_idx = max(0, offset - 2*sps)
 		end_idx = min(len(mf), start_idx + len(bit_array)*sps + 10*sps)
 		mf_sync = mf[start_idx:end_idx]
 
-		# --- Фазовая коррекция ---
+		# Фазовая коррекция
 		ref_sync = gmsk_modulate(syncword, sps=sps, bt=bt)
 		rx_sync_segment = mf_sync[offset-start_idx:offset-start_idx+len(ref_sync)]
 		phase_offset = np.angle(np.sum(rx_sync_segment * np.conj(ref_sync)))
 		mf_corr = mf_sync * np.exp(-1j*phase_offset)
 
-		# --- Кубический ресемплинг ---
+		# Кубический ресемплинг
 		t_original = np.arange(len(mf_corr))
 		t_target = (offset - start_idx) + np.arange(0, len(bit_array)) * sps
 		I_spline = CubicSpline(t_original, mf_corr.real)
 		Q_spline = CubicSpline(t_original, mf_corr.imag)
 		resampled = I_spline(t_target) + 1j*Q_spline(t_target)
 
-		# --- Дифференциальная демодуляция ---
+		# Дифференциальная демодуляция
 		demod = differential_demod(resampled)
 
-		# --- BER только по полезной нагрузке ---
+		# BER только по полезной нагрузке
 		payload_tx = bit_array[ts_len+1:]
 		payload_rx = demod[ts_len:ts_len+len(payload_tx)]
 		if len(payload_tx) > 0 and len(payload_rx) == len(payload_tx):
@@ -382,6 +381,7 @@ class FakeTRX(Transceiver):
 		print(f"[BER]: {ber:.5f} (payload len: {len(payload_tx)})")
 
 		# time.sleep(100)
+		# Конец нашей работы
 
 		msg.toa256 = self.toa256
 		if not self.fake_rssi_enabled:
